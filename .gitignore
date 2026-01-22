@@ -1,0 +1,4 @@
+.venv
+WORLD/
+*.blocks
+.vscode
