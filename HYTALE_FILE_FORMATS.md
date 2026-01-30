@@ -135,9 +135,14 @@ Sections automatically promote/demote based on unique block count:
 
 **Palette Entries (repeat `PALETTE_SIZE` times):**
 
+**IMPORTANT:** The size of INTERNAL_ID depends on the palette type:
+- **HalfByte (1)**: 1 byte (values 0-15)
+- **Byte (2)**: 1 byte (values 0-255)
+- **Short (3)**: **2 bytes** (values 0-65535)
+
 | Size | Type   | Field       | Description                        |
 |------|--------|-------------|------------------------------------|
-| 1    | byte   | INTERNAL_ID | Internal palette index (0-255)     |
+| 1-2  | byte/short | INTERNAL_ID | Internal palette index (**1 byte for HalfByte/Byte, 2 bytes for Short**) |
 | 2    | short  | NAME_LENGTH | Length of block name string        |
 | var  | string | NAME        | Block identifier (UTF-8)           |
 | 2    | short  | COUNT       | Number of blocks using this entry  |
@@ -190,6 +195,105 @@ return ((y & 31) << 10) | ((z & 31) << 5) | (x & 31);
 
 **Runtime vs Storage:**
 The Java runtime code uses Y-Z-X ordering, and the save file format matches this exactly.
+
+---
+
+## Fluid Storage Format
+
+Fluid sections (32×32×32 blocks) store fluid type and level data separately, using a hybrid palette + raw data approach.
+
+### Fluid Section Structure
+
+**Header & Type Palette** (same format as block palette):
+- 1 byte: palette_type (0=Empty, 1=HalfByte, 2=Byte, 3=Short)
+- 2 bytes: palette_size
+- For each entry:
+  - 1-2 bytes: internal_id (size depends on palette_type)
+  - 2 bytes: name_length
+  - n bytes: name (e.g., "Water_Source", "Lava")
+  - 2 bytes: count
+
+**Type Data Array** (Y-Z-X indexed):
+- Size depends on palette type (same as blocks):
+  - HalfByte: 16,384 bytes (4 bits per block)
+  - Byte: 32,768 bytes (1 byte per block)
+  - Short: 65,536 bytes (2 bytes per block)
+- Stores internal ID for fluid type at each position
+
+**Level Data Array** (Y-Z-X indexed):
+- **Always 16,384 bytes** (4 bits per block, values 0-15)
+- Stores **raw fluid level** (NOT palette-based!)
+- 0 = no fluid, 1-15 = fluid depth/level
+- Same nibble packing as HalfByte palette (2 blocks per byte)
+
+**Footer:**
+- 1 byte: nonZeroLevels counter (number of non-zero fluid levels)
+
+### Reading Fluid Data
+
+```python
+# Parse fluid section
+reader = io.BytesIO(fluid_data)
+
+# 1. Read type palette
+type_palette_type = struct.unpack('>B', reader.read(1))[0]
+type_palette_size = struct.unpack('>H', reader.read(2))[0]
+
+type_palette = {}
+for i in range(type_palette_size):
+    # Size of internal_id depends on palette type!
+    if type_palette_type == 3:  # Short
+        internal_id = struct.unpack('>H', reader.read(2))[0]
+    else:  # HalfByte or Byte
+        internal_id = struct.unpack('>B', reader.read(1))[0]
+
+    name_length = struct.unpack('>H', reader.read(2))[0]
+    name = reader.read(name_length).decode('utf-8')
+    count = struct.unpack('>H', reader.read(2))[0]
+    type_palette[internal_id] = name
+
+# 2. Read type data array
+if type_palette_type == 1:
+    type_data = reader.read(16384)
+elif type_palette_type == 2:
+    type_data = reader.read(32768)
+elif type_palette_type == 3:
+    type_data = reader.read(65536)
+
+# 3. Read level data array (always 4-bit packed)
+level_data = reader.read(16384)
+
+# 4. Get fluid at position (x, y, z)
+flat_idx = ((localY & 31) << 10) | ((localZ & 31) << 5) | (localX & 31)
+
+# Get fluid type from type_data
+if type_palette_type == 1:  # HalfByte
+    byte_idx = flat_idx // 2
+    if flat_idx % 2 == 0:
+        type_id = type_data[byte_idx] & 0x0F
+    else:
+        type_id = (type_data[byte_idx] >> 4) & 0x0F
+elif type_palette_type == 2:  # Byte
+    type_id = type_data[flat_idx]
+elif type_palette_type == 3:  # Short
+    type_id = struct.unpack('>H', type_data[flat_idx*2:flat_idx*2+2])[0]
+
+fluid_type = type_palette.get(type_id, "Empty")
+
+# Get fluid level from level_data (always 4-bit)
+byte_idx = flat_idx // 2
+if flat_idx % 2 == 0:
+    level = level_data[byte_idx] & 0x0F
+else:
+    level = (level_data[byte_idx] >> 4) & 0x0F
+```
+
+### Key Differences from Block Storage
+
+1. **Two separate arrays**: Type (palette-based) and Level (raw 4-bit values)
+2. **Level is always 4-bit**: Unlike block storage where palette type determines storage size
+3. **No migration count**: Fluid sections start directly with palette_type
+4. **Footer byte**: Contains nonZeroLevels counter
 
 ---
 
@@ -492,7 +596,12 @@ def parse_block_section(section_data):
     # Read palette: mapping from internal ID to block name
     palette = {}
     for i in range(palette_size):
-        internal_id = struct.unpack('>B', reader.read(1))[0]
+        # Internal ID size depends on palette type!
+        if palette_type == 3:  # Short
+            internal_id = struct.unpack('>H', reader.read(2))[0]
+        else:  # HalfByte (1) or Byte (2)
+            internal_id = struct.unpack('>B', reader.read(1))[0]
+
         name_length = struct.unpack('>H', reader.read(2))[0]
         block_name = reader.read(name_length).decode('utf-8')
         count = struct.unpack('>H', reader.read(2))[0]
@@ -559,7 +668,12 @@ def get_block_at(section_data, x, y, z):
     # Read palette
     palette = {}
     for i in range(palette_size):
-        internal_id = struct.unpack('>B', reader.read(1))[0]
+        # Internal ID size depends on palette type
+        if palette_type == 3:  # Short
+            internal_id = struct.unpack('>H', reader.read(2))[0]
+        else:  # HalfByte or Byte
+            internal_id = struct.unpack('>B', reader.read(1))[0]
+
         name_length = struct.unpack('>H', reader.read(2))[0]
         block_name = reader.read(name_length).decode('utf-8')
         count = struct.unpack('>H', reader.read(2))[0]

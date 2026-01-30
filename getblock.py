@@ -5,7 +5,8 @@ from pathlib import Path
 import bson
 import io
 
-BASE_PATH = "SRV/universe/worlds/default/chunks"
+# BASE_PATH = "SRV/universe/worlds/default/chunks"
+BASE_PATH = "C:/Users/Jacob/AppData/Roaming/Hytale/UserData/Saves/2026-01-30/universe/worlds/default_world/chunks"
 HEADER_LENGTH = 32
 
 def get_block(x, y, z, quiet=False):
@@ -74,7 +75,12 @@ def get_block(x, y, z, quiet=False):
         # Read palette: mapping from internal ID to block name
         palette = {}
         for i in range(palette_size):
-            internal_id = struct.unpack('>B', reader.read(1))[0]
+            # Internal ID size depends on palette type!
+            if palette_type == 3:  # Short
+                internal_id = struct.unpack('>H', reader.read(2))[0]
+            else:  # HalfByte (1) or Byte (2)
+                internal_id = struct.unpack('>B', reader.read(1))[0]
+
             name_length = struct.unpack('>H', reader.read(2))[0]
             block_name = reader.read(name_length).decode('utf-8')
             count = struct.unpack('>H', reader.read(2))[0]
