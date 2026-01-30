@@ -529,8 +529,15 @@ def get_block_color(block_name, biome_tint=None):
         b = int(base_color[2] * (1.0 - multiplier) + biome_tint[2] * multiplier)
         base_color = (r, g, b)
 
-    # Apply ParticleColor multiplier
-    if particle_color:
+        # Apply ParticleColor ONLY if biome tint < 100%
+        # (as per map_renderer.py line 168: "if particle_color_str and biome_tint_multiplier < 1.0")
+        if particle_color and multiplier < 1.0:
+            r = (base_color[0] * particle_color[0]) // 255
+            g = (base_color[1] * particle_color[1]) // 255
+            b = (base_color[2] * particle_color[2]) // 255
+            base_color = (r, g, b)
+    elif particle_color:
+        # No biome tinting, just apply ParticleColor
         r = (base_color[0] * particle_color[0]) // 255
         g = (base_color[1] * particle_color[1]) // 255
         b = (base_color[2] * particle_color[2]) // 255
