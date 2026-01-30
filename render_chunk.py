@@ -132,9 +132,9 @@ def parse_biome_tints(chunk_data):
             # Extract 10 bits
             value = ((byte1 >> bit_in_byte) | (byte2 << (8 - bit_in_byte))) & 0x3FF
 
-            # Map to x, z coordinates
-            x = i % 32
-            z = i // 32
+            # Map to x, z coordinates (data stored in column-major order: Z varies fastest)
+            z = i % 32
+            x = i // 32
 
             # Look up color in palette
             if value < len(tint_palette):
@@ -546,19 +546,24 @@ def get_block_color(block_name, biome_tint=None):
     return base_color
 
 
-def calculate_shading(height, neighbors):
+def calculate_shading(height, neighbors, pixel_x=0.5, pixel_z=0.5):
     """
     Calculate terrain shading based on slope using heightmap gradients.
     Based on ImageBuilder.shadeFromHeights()
 
-    neighbors: (N, S, W, E, NW, NE, SW, SE)
+    Args:
+        height: Center height
+        neighbors: (N, S, W, E, NW, NE, SW, SE)
+        pixel_x: Sub-pixel X position within block (0.0-1.0)
+        pixel_z: Sub-pixel Z position within block (0.0-1.0)
+
     Returns: shading multiplier (0.0 - 1.0+)
     """
     n, s, w, e, nw, ne, sw, se = neighbors
 
-    # Normalized position within block (center of pixel)
-    u = 0.5
-    v = 0.5
+    # Normalized position within block
+    u = pixel_x
+    v = pixel_z
 
     # Diagonal coordinates for diagonal gradient sampling
     ud = (u + v) / 2.0
@@ -610,14 +615,15 @@ def calculate_shading(height, neighbors):
     return ambient + diffuse * lambert
 
 
-def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
+def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2):
     """
-    Render a chunk to a 32x32 PNG image
+    Render a chunk to a PNG image
 
     Args:
         chunk_x: Chunk X coordinate (world_x // 32)
         chunk_z: Chunk Z coordinate (world_z // 32)
         output_path: Output PNG file path
+        pixels_per_block: Resolution multiplier (1=32x32, 2=64x64, etc.)
     """
     print(f"Rendering chunk ({chunk_x}, {chunk_z})...")
 
@@ -644,8 +650,9 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
             blocks[z][x] = block_name
 
     # Create image
-    print("Rendering image...")
-    img = Image.new('RGB', (32, 32))
+    print(f"Rendering image at {pixels_per_block}x resolution...")
+    img_size = 32 * pixels_per_block
+    img = Image.new('RGB', (img_size, img_size))
     pixels = img.load()
 
     for z in range(32):
@@ -657,7 +664,7 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
             biome_tint = biome_tints[z][x] if biome_tints else None
 
             # Get base color with biome tinting
-            r, g, b = get_block_color(block_name, biome_tint)
+            base_r, base_g, base_b = get_block_color(block_name, biome_tint)
 
             # Get neighbor heights for shading
             n = heights[z-1][x] if z > 0 else height
@@ -669,21 +676,32 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
             sw = heights[z+1][x-1] if z < 31 and x > 0 else height
             se = heights[z+1][x+1] if z < 31 and x < 31 else height
 
-            # Calculate shading
-            shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se))
-
-            # Apply shading
-            r = int(min(255, r * shade))
-            g = int(min(255, g * shade))
-            b = int(min(255, b * shade))
-
-            # Check for fluid and blend
+            # Check for fluid once per block
             fluid_type, fluid_depth = find_surface_fluid(chunk_data, x, z, height)
-            if fluid_type and fluid_depth > 0:
-                r, g, b = blend_fluid_color((r, g, b), fluid_type, fluid_depth)
 
-            # Set pixel
-            pixels[x, z] = (r, g, b)
+            # Render each pixel within this block
+            for sub_z in range(pixels_per_block):
+                for sub_x in range(pixels_per_block):
+                    # Calculate sub-pixel position (0.0 to 1.0)
+                    pixel_x = (sub_x + 0.5) / pixels_per_block
+                    pixel_z = (sub_z + 0.5) / pixels_per_block
+
+                    # Calculate shading with sub-pixel position
+                    shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+
+                    # Apply shading
+                    r = int(min(255, base_r * shade))
+                    g = int(min(255, base_g * shade))
+                    b = int(min(255, base_b * shade))
+
+                    # Apply fluid if present
+                    if fluid_type and fluid_depth > 0:
+                        r, g, b = blend_fluid_color((r, g, b), fluid_type, fluid_depth)
+
+                    # Set pixel in image
+                    pixel_img_x = x * pixels_per_block + sub_x
+                    pixel_img_z = z * pixels_per_block + sub_z
+                    pixels[pixel_img_x, pixel_img_z] = (r, g, b)
 
     # Save image
     img.save(output_path)

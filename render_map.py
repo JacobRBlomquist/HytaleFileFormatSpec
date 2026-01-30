@@ -8,7 +8,7 @@ from render_chunk import read_chunk_data, find_surface_height, find_surface_flui
 from render_chunk import get_block_color, calculate_shading, blend_fluid_color, parse_biome_tints
 
 
-def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
+def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per_block=2):
     """
     Render a range of chunks into a single map image
 
@@ -18,16 +18,18 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
         end_x: Ending chunk X coordinate (inclusive)
         end_z: Ending chunk Z coordinate (inclusive)
         output_path: Output PNG file path
+        pixels_per_block: Resolution multiplier (1=32px/chunk, 2=64px/chunk, etc.)
     """
     chunks_width = end_x - start_x + 1
     chunks_height = end_z - start_z + 1
 
     print(f"Rendering {chunks_width}x{chunks_height} chunks ({chunks_width * chunks_height} total)")
     print(f"Chunk range: ({start_x}, {start_z}) to ({end_x}, {end_z})")
+    print(f"Resolution: {pixels_per_block}x pixels per block")
 
-    # Create output image (32 pixels per chunk)
-    img_width = chunks_width * 32
-    img_height = chunks_height * 32
+    # Create output image
+    img_width = chunks_width * 32 * pixels_per_block
+    img_height = chunks_height * 32 * pixels_per_block
     img = Image.new('RGB', (img_width, img_height))
     pixels = img.load()
 
@@ -65,7 +67,7 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
                     biome_tint = biome_tints[z][x] if biome_tints else None
 
                     # Get base color with biome tinting
-                    r, g, b = get_block_color(block_name, biome_tint)
+                    base_r, base_g, base_b = get_block_color(block_name, biome_tint)
 
                     # Get neighbor heights for shading
                     n = heights[z-1][x] if z > 0 else height
@@ -77,25 +79,34 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
                     sw = heights[z+1][x-1] if z < 31 and x > 0 else height
                     se = heights[z+1][x+1] if z < 31 and x < 31 else height
 
-                    # Calculate shading
-                    shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se))
-
-                    # Apply shading
-                    r = int(min(255, r * shade))
-                    g = int(min(255, g * shade))
-                    b = int(min(255, b * shade))
-
-                    # Check for fluid and blend
+                    # Check for fluid once per block
                     fluid_type, fluid_depth = find_surface_fluid(chunk_data, x, z, height)
-                    if fluid_type and fluid_depth > 0:
-                        r, g, b = blend_fluid_color((r, g, b), fluid_type, fluid_depth)
 
-                    # Calculate pixel position in final image
-                    pixel_x = (chunk_x - start_x) * 32 + x
-                    pixel_z = (chunk_z - start_z) * 32 + z
+                    # Render each pixel within this block
+                    for sub_z in range(pixels_per_block):
+                        for sub_x in range(pixels_per_block):
+                            # Calculate sub-pixel position (0.0 to 1.0)
+                            pixel_x = (sub_x + 0.5) / pixels_per_block
+                            pixel_z = (sub_z + 0.5) / pixels_per_block
 
-                    # Set pixel
-                    pixels[pixel_x, pixel_z] = (r, g, b)
+                            # Calculate shading with sub-pixel position
+                            shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+
+                            # Apply shading
+                            r = int(min(255, base_r * shade))
+                            g = int(min(255, base_g * shade))
+                            b = int(min(255, base_b * shade))
+
+                            # Apply fluid if present
+                            if fluid_type and fluid_depth > 0:
+                                r, g, b = blend_fluid_color((r, g, b), fluid_type, fluid_depth)
+
+                            # Calculate pixel position in final image
+                            pixel_img_x = (chunk_x - start_x) * 32 * pixels_per_block + x * pixels_per_block + sub_x
+                            pixel_img_z = (chunk_z - start_z) * 32 * pixels_per_block + z * pixels_per_block + sub_z
+
+                            # Set pixel
+                            pixels[pixel_img_x, pixel_img_z] = (r, g, b)
 
     # Save image
     img.save(output_path)
@@ -105,19 +116,22 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python render_map.py <start_chunk_x> <start_chunk_z> <end_chunk_x> <end_chunk_z> [output.png]")
+        print("Usage: python render_map.py <start_chunk_x> <start_chunk_z> <end_chunk_x> <end_chunk_z> [output.png] [pixels_per_block]")
         print()
         print("Example: python render_map.py -2 -2 2 2")
-        print("  Renders a 5x5 grid of chunks (160x160 pixels)")
+        print("  Renders a 5x5 grid of chunks at 2x resolution (320x320 pixels)")
         print()
-        print("Example: python render_map.py 0 0 3 3 my_map.png")
-        print("  Renders a 4x4 grid of chunks (128x128 pixels)")
+        print("Example: python render_map.py 0 0 3 3 my_map.png 2")
+        print("  Renders a 4x4 grid of chunks at 2x resolution (256x256 pixels)")
+        print()
+        print("  pixels_per_block: 1=32px/chunk (blocky), 2=64px/chunk (smooth, default)")
         sys.exit(1)
 
     start_x = int(sys.argv[1])
     start_z = int(sys.argv[2])
     end_x = int(sys.argv[3])
     end_z = int(sys.argv[4])
-    output = sys.argv[5] if len(sys.argv) > 5 else f"map_{start_x}_{start_z}_to_{end_x}_{end_z}.png"
+    output = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].isdigit() else f"map_{start_x}_{start_z}_to_{end_x}_{end_z}.png"
+    pixels_per_block = int(sys.argv[6]) if len(sys.argv) > 6 else (int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 2)
 
-    render_map(start_x, start_z, end_x, end_z, output)
+    render_map(start_x, start_z, end_x, end_z, output, pixels_per_block)
