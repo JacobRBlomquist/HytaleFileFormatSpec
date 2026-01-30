@@ -78,6 +78,73 @@ def read_chunk_data(chunk_x, chunk_z):
         return bson.decode(decompressed)
 
 
+def parse_biome_tints(chunk_data):
+    """
+    Parse biome tint colors from BlockChunk.Data
+    Returns: 32x32 array of (r, g, b) tuples
+    """
+    if 'BlockChunk' not in chunk_data['Components']:
+        return None
+
+    block_chunk_data = chunk_data['Components']['BlockChunk']['Data']
+    reader = io.BytesIO(block_chunk_data)
+
+    # Read needsPhysics (1 byte)
+    needs_physics = struct.unpack('B', reader.read(1))[0]
+
+    # Parse ShortBytePalette (heightmap) - we'll skip this
+    height_count = struct.unpack('<H', reader.read(2))[0]
+    # Skip height palette entries (2 bytes each)
+    reader.read(height_count * 2)
+    # Skip packed height data
+    height_packed_len = struct.unpack('<I', reader.read(4))[0]
+    reader.read(height_packed_len)
+
+    # Parse IntBytePalette (biome tints)
+    tint_count = struct.unpack('<H', reader.read(2))[0]
+
+    # Read tint palette (RGB colors)
+    tint_palette = []
+    for i in range(tint_count):
+        rgb_int = struct.unpack('<I', reader.read(4))[0]
+        r = (rgb_int >> 16) & 0xFF
+        g = (rgb_int >> 8) & 0xFF
+        b = rgb_int & 0xFF
+        tint_palette.append((r, g, b))
+
+    # Read packed tint indices
+    tint_packed_len = struct.unpack('<I', reader.read(4))[0]
+    tint_packed_data = reader.read(tint_packed_len)
+
+    # Unpack 10-bit indices (1024 values, 1280 bytes)
+    tint_colors = [[None for _ in range(32)] for _ in range(32)]
+    for i in range(1024):
+        # Extract 10-bit value from packed data
+        bit_offset = i * 10
+        byte_offset = bit_offset // 8
+        bit_in_byte = bit_offset % 8
+
+        # Read 2 bytes to get the 10-bit value
+        if byte_offset + 1 < len(tint_packed_data):
+            byte1 = tint_packed_data[byte_offset]
+            byte2 = tint_packed_data[byte_offset + 1] if byte_offset + 1 < len(tint_packed_data) else 0
+
+            # Extract 10 bits
+            value = ((byte1 >> bit_in_byte) | (byte2 << (8 - bit_in_byte))) & 0x3FF
+
+            # Map to x, z coordinates
+            x = i % 32
+            z = i // 32
+
+            # Look up color in palette
+            if value < len(tint_palette):
+                tint_colors[z][x] = tint_palette[value]
+            else:
+                tint_colors[z][x] = (255, 255, 255)  # White fallback
+
+    return tint_colors
+
+
 def parse_block_section(section_data):
     """Parse block section to get palette and blocks array"""
     reader = io.BytesIO(section_data)
@@ -366,10 +433,16 @@ def find_surface_fluid(chunk_data, x, z, surface_y):
     return None, 0
 
 
-def get_block_color(block_name):
+def get_block_color(block_name, biome_tint=None):
     """
-    Get block color from block_properties.json
-    Uses ParticleColor for most blocks, TintUp for grass (which also uses biome tinting)
+    Get block color from block_properties.json with optional biome tinting
+
+    Args:
+        block_name: Name of the block
+        biome_tint: Optional (r, g, b) tuple for biome tinting
+
+    Returns:
+        (r, g, b) color tuple
     """
     if block_name == "Empty":
         return (0, 0, 0)
@@ -377,74 +450,93 @@ def get_block_color(block_name):
     # Load properties
     properties = load_block_properties()
 
+    base_color = None
+    biome_tint_percent = 0
+    particle_color = None
+
     # Check exact match
     if block_name in properties:
         block_props = properties[block_name]
 
-        # For grass blocks (Soil_Grass*), prefer TintUp over ParticleColor
-        if "Soil_Grass" in block_name and block_props.get("TintUp"):
-            tint_color = hex_to_rgb(block_props["TintUp"][0])
-            if tint_color:
-                return tint_color
-
-        # Use ParticleColor if available
-        particle_color = block_props.get("ParticleColor")
-        if particle_color:
-            color = hex_to_rgb(particle_color)
-            if color:
-                return color
-
-        # If no ParticleColor, try TintUp (for plants without ParticleColor)
+        # Get TintUp as base color if available
         if block_props.get("TintUp"):
-            tint_color = hex_to_rgb(block_props["TintUp"][0])
-            if tint_color:
-                return tint_color
+            base_color = hex_to_rgb(block_props["TintUp"][0])
+            biome_tint_percent = block_props.get("BiomeTintUp", 0)
 
-    # Try partial matches (for blocks with state suffixes like _Full, _State_*, etc.)
-    for key in properties:
-        if block_name.startswith(key):
-            block_props = properties[key]
+        # Get ParticleColor if available
+        if block_props.get("ParticleColor"):
+            pc = hex_to_rgb(block_props["ParticleColor"])
+            if pc:
+                particle_color = pc
 
-            # For grass blocks, prefer TintUp
-            if "Soil_Grass" in key and block_props.get("TintUp"):
-                tint_color = hex_to_rgb(block_props["TintUp"][0])
-                if tint_color:
-                    return tint_color
+        # If no TintUp, use ParticleColor as base
+        if not base_color and particle_color:
+            base_color = particle_color
+            particle_color = None  # Don't multiply twice
 
-            # Use ParticleColor if available
-            particle_color = block_props.get("ParticleColor")
-            if particle_color:
-                color = hex_to_rgb(particle_color)
-                if color:
-                    return color
+    # Try partial matches (for blocks with state suffixes)
+    if not base_color:
+        for key in properties:
+            if block_name.startswith(key):
+                block_props = properties[key]
 
-            # If no ParticleColor, try TintUp
-            if block_props.get("TintUp"):
-                tint_color = hex_to_rgb(block_props["TintUp"][0])
-                if tint_color:
-                    return tint_color
+                # Get TintUp as base color
+                if block_props.get("TintUp"):
+                    base_color = hex_to_rgb(block_props["TintUp"][0])
+                    biome_tint_percent = block_props.get("BiomeTintUp", 0)
 
-    # Fallback colors for common types
-    print(f"Warning: Using fallback color for block '{block_name}'")
+                # Get ParticleColor
+                if block_props.get("ParticleColor"):
+                    pc = hex_to_rgb(block_props["ParticleColor"])
+                    if pc:
+                        particle_color = pc
 
-    if "Grass" in block_name:
-        return (103, 182, 45)  # Default grass green
-    elif "Leaves" in block_name:
-        return (75, 133, 25)   # Default leaf green
-    elif "Stone" in block_name or "Rock" in block_name:
-        return (120, 120, 120)
-    elif "Wood" in block_name or "Trunk" in block_name:
-        return (120, 90, 50)
-    elif "Dirt" in block_name or "Soil" in block_name:
-        return (139, 90, 43)
-    elif "Sand" in block_name:
-        return (220, 215, 200)
-    elif "Water" in block_name:
-        return (63, 118, 228)
+                # If no TintUp, use ParticleColor as base
+                if not base_color and particle_color:
+                    base_color = particle_color
+                    particle_color = None
 
-    # Default gray
-    print(f"Warning: Using default gray for unknown block '{block_name}'")
-    return (128, 128, 128)
+                if base_color:
+                    break
+
+    # Fallback colors
+    if not base_color:
+        print(f"Warning: Using fallback color for block '{block_name}'")
+
+        if "Grass" in block_name:
+            base_color = (103, 182, 45)
+        elif "Leaves" in block_name:
+            base_color = (75, 133, 25)
+        elif "Stone" in block_name or "Rock" in block_name:
+            base_color = (120, 120, 120)
+        elif "Wood" in block_name or "Trunk" in block_name:
+            base_color = (120, 90, 50)
+        elif "Dirt" in block_name or "Soil" in block_name:
+            base_color = (139, 90, 43)
+        elif "Sand" in block_name:
+            base_color = (220, 215, 200)
+        elif "Water" in block_name:
+            base_color = (63, 118, 228)
+        else:
+            print(f"Warning: Using default gray for unknown block '{block_name}'")
+            base_color = (128, 128, 128)
+
+    # Apply biome tinting if available
+    if biome_tint and biome_tint_percent > 0:
+        multiplier = biome_tint_percent / 100.0
+        r = int(base_color[0] * (1.0 - multiplier) + biome_tint[0] * multiplier)
+        g = int(base_color[1] * (1.0 - multiplier) + biome_tint[1] * multiplier)
+        b = int(base_color[2] * (1.0 - multiplier) + biome_tint[2] * multiplier)
+        base_color = (r, g, b)
+
+    # Apply ParticleColor multiplier
+    if particle_color:
+        r = (base_color[0] * particle_color[0]) // 255
+        g = (base_color[1] * particle_color[1]) // 255
+        b = (base_color[2] * particle_color[2]) // 255
+        base_color = (r, g, b)
+
+    return base_color
 
 
 def calculate_shading(height, neighbors):
@@ -527,6 +619,12 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
     if chunk_data is None:
         return
 
+    # Parse biome tints
+    print("Parsing biome tints...")
+    biome_tints = parse_biome_tints(chunk_data)
+    if biome_tints is None:
+        print("Warning: No biome tint data found, using colors without tinting")
+
     # Create 32x32 heightmap
     print("Building heightmap...")
     heights = [[0 for _ in range(32)] for _ in range(32)]
@@ -548,8 +646,11 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
             height = heights[z][x]
             block_name = blocks[z][x]
 
-            # Get base color
-            r, g, b = get_block_color(block_name)
+            # Get biome tint for this position
+            biome_tint = biome_tints[z][x] if biome_tints else None
+
+            # Get base color with biome tinting
+            r, g, b = get_block_color(block_name, biome_tint)
 
             # Get neighbor heights for shading
             n = heights[z-1][x] if z > 0 else height

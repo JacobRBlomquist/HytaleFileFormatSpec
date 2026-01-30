@@ -5,7 +5,7 @@ Renders multiple chunks into a single map image
 import sys
 from PIL import Image
 from render_chunk import read_chunk_data, find_surface_height, find_surface_fluid
-from render_chunk import get_block_color, calculate_shading, blend_fluid_color
+from render_chunk import get_block_color, calculate_shading, blend_fluid_color, parse_biome_tints
 
 
 def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
@@ -42,6 +42,9 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
                 print(f"  Chunk ({chunk_x}, {chunk_z}) not found, skipping")
                 continue
 
+            # Parse biome tints
+            biome_tints = parse_biome_tints(chunk_data)
+
             # Build heightmap for this chunk
             heights = [[0 for _ in range(32)] for _ in range(32)]
             blocks = [["Empty" for _ in range(32)] for _ in range(32)]
@@ -58,8 +61,11 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png"):
                     height = heights[z][x]
                     block_name = blocks[z][x]
 
-                    # Get base color
-                    r, g, b = get_block_color(block_name)
+                    # Get biome tint for this position
+                    biome_tint = biome_tints[z][x] if biome_tints else None
+
+                    # Get base color with biome tinting
+                    r, g, b = get_block_color(block_name, biome_tint)
 
                     # Get neighbor heights for shading
                     n = heights[z-1][x] if z > 0 else height
