@@ -6,6 +6,7 @@ import sys
 import struct
 import math
 import io
+import json
 from pathlib import Path
 sys.path.insert(0, "..")
 import compression.zstd as zstd
@@ -15,6 +16,29 @@ from PIL import Image
 # BASE_PATH = "SRV/universe/worlds/default/chunks"
 BASE_PATH = "C:/Users/Jacob/AppData/Roaming/Hytale/UserData/Saves/2026-01-30/universe/worlds/default_world/chunks"
 HEADER_LENGTH = 32
+
+# Cache for block properties
+_block_properties = None
+
+
+def load_block_properties():
+    """Load block properties from JSON file (cached)"""
+    global _block_properties
+    if _block_properties is None:
+        properties_path = Path(__file__).parent / "block_properties.json"
+        with open(properties_path, 'r') as f:
+            _block_properties = json.load(f)
+    return _block_properties
+
+
+def hex_to_rgb(hex_color):
+    """Convert hex color string to RGB tuple"""
+    if not hex_color or not hex_color.startswith('#'):
+        return None
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) == 3:
+        hex_color = ''.join([c*2 for c in hex_color])
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 def read_chunk_data(chunk_x, chunk_z):
     """Read chunk from region file"""
@@ -116,6 +140,143 @@ def get_block_at(palette, blocks_array, palette_type, x, y, z):
     return palette.get(internal_id, "Empty")
 
 
+def parse_fluid_section(fluid_data):
+    """Parse fluid section to get type palette, type array, and level array"""
+    reader = io.BytesIO(fluid_data)
+
+    # Check if we have enough data for header
+    if len(fluid_data) < 3:
+        return {}, None, None, 0
+
+    # Read header (no migration_count for fluids)
+    palette_type_bytes = reader.read(1)
+    if len(palette_type_bytes) < 1:
+        return {}, None, None, 0
+    palette_type = struct.unpack('>B', palette_type_bytes)[0]
+
+    palette_size_bytes = reader.read(2)
+    if len(palette_size_bytes) < 2:
+        return {}, None, None, 0
+    palette_size = struct.unpack('>H', palette_size_bytes)[0]
+
+    # Read type palette
+    type_palette = {}
+    for i in range(palette_size):
+        try:
+            if palette_type == 3:  # Short
+                internal_id = struct.unpack('>H', reader.read(2))[0]
+            else:
+                internal_id = struct.unpack('>B', reader.read(1))[0]
+
+            name_length = struct.unpack('>H', reader.read(2))[0]
+            fluid_name = reader.read(name_length).decode('utf-8')
+            count = struct.unpack('>H', reader.read(2))[0]
+            type_palette[internal_id] = fluid_name
+        except:
+            # Malformed palette entry, return empty
+            return type_palette, None, None, palette_type
+
+    # Read type data array based on palette type
+    if palette_type == 0:  # Empty
+        return type_palette, None, None, palette_type
+    elif palette_type == 1:  # HalfByte
+        type_array = reader.read(16384)
+    elif palette_type == 2:  # Byte
+        type_array = reader.read(32768)
+    elif palette_type == 3:  # Short
+        type_array = reader.read(65536)
+    else:
+        return type_palette, None, None, palette_type
+
+    # Verify we got the expected array size
+    if len(type_array) == 0:
+        return type_palette, None, None, palette_type
+
+    # Read level data array (ALWAYS 4-bit, 16384 bytes)
+    level_array = reader.read(16384)
+
+    # Verify we got the expected level array size
+    if len(level_array) < 16384:
+        return type_palette, None, None, palette_type
+
+    return type_palette, type_array, level_array, palette_type
+
+
+def get_fluid_at(type_palette, type_array, level_array, palette_type, x, y, z):
+    """Get fluid type and level at local coordinates (0-31)"""
+    if type_array is None or level_array is None:
+        return None, 0
+
+    # Calculate flat index (Y-Z-X ordering)
+    flat_idx = ((y & 31) << 10) | ((z & 31) << 5) | (x & 31)
+
+    # Get fluid type internal ID
+    if palette_type == 1:  # HalfByte
+        byte_idx = flat_idx // 2
+        if flat_idx % 2 == 0:
+            type_id = type_array[byte_idx] & 0x0F
+        else:
+            type_id = (type_array[byte_idx] >> 4) & 0x0F
+    elif palette_type == 2:  # Byte
+        type_id = type_array[flat_idx]
+    elif palette_type == 3:  # Short
+        type_id = struct.unpack('>H', type_array[flat_idx*2:flat_idx*2+2])[0]
+    else:
+        return None, 0
+
+    fluid_type = type_palette.get(type_id)
+    if not fluid_type or fluid_type == "Empty":
+        return None, 0
+
+    # Get fluid level (always 4-bit)
+    byte_idx = flat_idx // 2
+    if flat_idx % 2 == 0:
+        level = level_array[byte_idx] & 0x0F
+    else:
+        level = (level_array[byte_idx] >> 4) & 0x0F
+
+    return fluid_type, level
+
+
+def blend_fluid_color(terrain_color, fluid_type, fluid_level):
+    """Blend fluid color over terrain based on depth
+
+    Uses hardcoded colors:
+    - Water: #1983d9 (Zone1 default)
+    - Lava: #f94e11 (from Fluid_Lava.json ParticleColor)
+    """
+    if not fluid_type or fluid_level == 0:
+        return terrain_color
+
+    # Get base fluid color (hardcoded)
+    if "Water" in fluid_type:
+        # Zone1 WaterTint: #1983d9 = RGB(25, 131, 217)
+        fluid_color = (25, 131, 217)
+    elif "Lava" in fluid_type:
+        # Lava ParticleColor: #f94e11 = RGB(249, 78, 17)
+        fluid_color = (249, 78, 17)
+    else:
+        # Unknown fluid, return terrain
+        return terrain_color
+
+    # Blend based on depth (level 0-15, higher = deeper)
+    # Algorithm from ImageBuilder.getFluidColor:
+    # depth_multiplier = min(1.0, 1.0 / fluid_level)
+    # final = fluid_color + (terrain_color - fluid_color) * depth_multiplier
+    depth_multiplier = min(1.0, 1.0 / max(1, fluid_level))
+
+    r = int(fluid_color[0] + (terrain_color[0] - fluid_color[0]) * depth_multiplier)
+    g = int(fluid_color[1] + (terrain_color[1] - fluid_color[1]) * depth_multiplier)
+    b = int(fluid_color[2] + (terrain_color[2] - fluid_color[2]) * depth_multiplier)
+
+    # Clamp to valid range
+    r = min(255, max(0, r))
+    g = min(255, max(0, g))
+    b = min(255, max(0, b))
+
+    return (r, g, b)
+
+
 def find_surface_height(chunk_data, x, z):
     """
     Find the top solid block at column (x, z)
@@ -151,91 +312,203 @@ def find_surface_height(chunk_data, x, z):
     return 0, "Empty", 0
 
 
+def find_surface_fluid(chunk_data, x, z, surface_y):
+    """
+    Find the topmost fluid and calculate its depth from surface
+    Depth = (top of water column Y) - (surface block Y)
+    Returns: (fluid_type, fluid_depth)
+    """
+    sections = chunk_data["Components"]["ChunkColumn"]["Sections"]
+
+    fluid_type = None
+    topmost_fluid_y = None
+
+    # Scan from top down to just above surface to find fluid column
+    for world_y in range(319, surface_y, -1):
+        section_idx = world_y // 32
+
+        if section_idx >= len(sections):
+            continue
+
+        section = sections[section_idx]
+        if "Fluid" not in section["Components"]:
+            continue
+
+        fluid_data = section["Components"]["Fluid"].get("Data")
+        if not fluid_data or len(fluid_data) < 3:
+            continue
+
+        type_palette, type_array, level_array, palette_type = parse_fluid_section(fluid_data)
+
+        if type_array is None or level_array is None:
+            continue
+
+        local_y = world_y % 32
+        current_fluid, fluid_level = get_fluid_at(type_palette, type_array, level_array, palette_type, x, local_y, z)
+
+        if current_fluid and fluid_level > 0:
+            if fluid_type is None:
+                # Found the topmost fluid
+                fluid_type = current_fluid
+                topmost_fluid_y = world_y
+            elif current_fluid != fluid_type:
+                # Different fluid type, stop
+                break
+        elif fluid_type is not None:
+            # Was in fluid, hit air/empty, stop
+            break
+
+    if fluid_type and topmost_fluid_y is not None:
+        # Depth is distance from surface to top of water
+        fluid_depth = topmost_fluid_y - surface_y
+        return fluid_type, fluid_depth
+
+    return None, 0
+
+
 def get_block_color(block_name):
     """
-    Simple color mapping for common blocks
-    In a full implementation, this would load from Assets
+    Get block color from block_properties.json
+    Uses ParticleColor for most blocks, TintUp for grass (which also uses biome tinting)
     """
-    # Basic color palette
-    colors = {
-        "Empty": (0, 0, 0),
-        "Soil_Grass": (103, 182, 45),
-        "Soil_Dirt": (139, 90, 43),
-        "Rock_Stone": (128, 128, 128),
-        "Rock_Stone_Cobble": (100, 100, 100),
-        "Wood_Beech_Trunk": (139, 90, 43),
-        "Plant_Grass_Lush": (50, 200, 50),
-        "Plant_Leaves": (34, 139, 34),
-        "Sand": (238, 214, 175),
-        "Water": (63, 118, 228),
-    }
+    if block_name == "Empty":
+        return (0, 0, 0)
+
+    # Load properties
+    properties = load_block_properties()
 
     # Check exact match
-    if block_name in colors:
-        return colors[block_name]
+    if block_name in properties:
+        block_props = properties[block_name]
 
-    # Check partial matches
-    for key in colors:
-        if key in block_name or block_name.startswith(key):
-            return colors[key]
+        # For grass blocks (Soil_Grass*), prefer TintUp over ParticleColor
+        if "Soil_Grass" in block_name and block_props.get("TintUp"):
+            tint_color = hex_to_rgb(block_props["TintUp"][0])
+            if tint_color:
+                return tint_color
 
-    # Check common prefixes
-    if "Grass" in block_name or "Plant" in block_name:
-        return (80, 180, 60)
+        # Use ParticleColor if available
+        particle_color = block_props.get("ParticleColor")
+        if particle_color:
+            color = hex_to_rgb(particle_color)
+            if color:
+                return color
+
+        # If no ParticleColor, try TintUp (for plants without ParticleColor)
+        if block_props.get("TintUp"):
+            tint_color = hex_to_rgb(block_props["TintUp"][0])
+            if tint_color:
+                return tint_color
+
+    # Try partial matches (for blocks with state suffixes like _Full, _State_*, etc.)
+    for key in properties:
+        if block_name.startswith(key):
+            block_props = properties[key]
+
+            # For grass blocks, prefer TintUp
+            if "Soil_Grass" in key and block_props.get("TintUp"):
+                tint_color = hex_to_rgb(block_props["TintUp"][0])
+                if tint_color:
+                    return tint_color
+
+            # Use ParticleColor if available
+            particle_color = block_props.get("ParticleColor")
+            if particle_color:
+                color = hex_to_rgb(particle_color)
+                if color:
+                    return color
+
+            # If no ParticleColor, try TintUp
+            if block_props.get("TintUp"):
+                tint_color = hex_to_rgb(block_props["TintUp"][0])
+                if tint_color:
+                    return tint_color
+
+    # Fallback colors for common types
+    print(f"Warning: Using fallback color for block '{block_name}'")
+
+    if "Grass" in block_name:
+        return (103, 182, 45)  # Default grass green
+    elif "Leaves" in block_name:
+        return (75, 133, 25)   # Default leaf green
     elif "Stone" in block_name or "Rock" in block_name:
         return (120, 120, 120)
     elif "Wood" in block_name or "Trunk" in block_name:
+        return (120, 90, 50)
+    elif "Dirt" in block_name or "Soil" in block_name:
         return (139, 90, 43)
-    elif "Soil" in block_name or "Dirt" in block_name:
-        return (139, 90, 43)
+    elif "Sand" in block_name:
+        return (220, 215, 200)
     elif "Water" in block_name:
         return (63, 118, 228)
-    elif "Leaves" in block_name:
-        return (34, 139, 34)
 
     # Default gray
+    print(f"Warning: Using default gray for unknown block '{block_name}'")
     return (128, 128, 128)
 
 
 def calculate_shading(height, neighbors):
     """
-    Calculate terrain shading based on slope
+    Calculate terrain shading based on slope using heightmap gradients.
+    Based on ImageBuilder.shadeFromHeights()
+
     neighbors: (N, S, W, E, NW, NE, SW, SE)
     Returns: shading multiplier (0.0 - 1.0+)
     """
     n, s, w, e, nw, ne, sw, se = neighbors
 
-    # Calculate gradients
-    dhdx = (e - w) / 2.0
-    dhdz = (s - n) / 2.0
+    # Normalized position within block (center of pixel)
+    u = 0.5
+    v = 0.5
+
+    # Diagonal coordinates for diagonal gradient sampling
+    ud = (u + v) / 2.0
+    vd = (1.0 - u + v) / 2.0
+
+    # Calculate height gradients in X and Z directions
+    # Using bilinear interpolation of neighbors
+    dhdx1 = (height - w) * (1.0 - u) + (e - height) * u
+    dhdz1 = (height - n) * (1.0 - v) + (s - height) * v
+
+    dhdx2 = (height - nw) * (1.0 - ud) + (se - height) * ud
+    dhdz2 = (height - ne) * (1.0 - vd) + (sw - height) * vd
+
+    # Weighted average of gradients (2:1 ratio)
+    dhdx = dhdx1 * 2.0 + dhdx2
+    dhdz = dhdz1 * 2.0 + dhdz2
 
     # Vertical scale factor
     dy = 3.0
 
-    # Surface normal
+    # Compute surface normal from gradients
     nx = dhdx
     ny = dy
     nz = dhdz
 
-    # Normalize
-    length = math.sqrt(nx*nx + ny*ny + nz*nz)
-    if length > 0:
-        nx /= length
-        ny /= length
-        nz /= length
+    # Normalize the normal vector
+    inv_s = 1.0 / math.sqrt(nx * nx + ny * ny + nz * nz)
+    nx *= inv_s
+    ny *= inv_s
+    nz *= inv_s
 
     # Light direction (from top-left-front)
-    lx, ly, lz = -0.2, 0.8, 0.5
-    length = math.sqrt(lx*lx + ly*ly + lz*lz)
-    lx /= length
-    ly /= length
-    lz /= length
+    lx = -0.2
+    ly = 0.8
+    lz = 0.5
 
-    # Diffuse lighting
+    # Normalize light direction
+    inv_l = 1.0 / math.sqrt(lx * lx + ly * ly + lz * lz)
+    lx *= inv_l
+    ly *= inv_l
+    lz *= inv_l
+
+    # Lambert diffuse lighting (dot product)
     lambert = max(0.0, nx * lx + ny * ly + nz * lz)
 
-    # 40% ambient + 60% diffuse
-    return 0.4 + 0.6 * lambert
+    # Final shading: 40% ambient + 60% diffuse
+    ambient = 0.4
+    diffuse = 0.6
+    return ambient + diffuse * lambert
 
 
 def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
@@ -295,6 +568,11 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png"):
             r = int(min(255, r * shade))
             g = int(min(255, g * shade))
             b = int(min(255, b * shade))
+
+            # Check for fluid and blend
+            fluid_type, fluid_depth = find_surface_fluid(chunk_data, x, z, height)
+            if fluid_type and fluid_depth > 0:
+                r, g, b = blend_fluid_color((r, g, b), fluid_type, fluid_depth)
 
             # Set pixel
             pixels[x, z] = (r, g, b)
