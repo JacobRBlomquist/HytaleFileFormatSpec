@@ -8,7 +8,7 @@ from render_chunk import read_chunk_data, find_surface_height, find_surface_flui
 from render_chunk import get_block_color, calculate_shading, blend_fluid_color, parse_biome_tints
 
 
-def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per_block=2):
+def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per_block=2, enable_shading=True):
     """
     Render a range of chunks into a single map image
 
@@ -19,6 +19,7 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per
         end_z: Ending chunk Z coordinate (inclusive)
         output_path: Output PNG file path
         pixels_per_block: Resolution multiplier (1=32px/chunk, 2=64px/chunk, etc.)
+        enable_shading: Whether to apply terrain shading (default True)
     """
     chunks_width = end_x - start_x + 1
     chunks_height = end_z - start_z + 1
@@ -44,17 +45,21 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per
                 print(f"  Chunk ({chunk_x}, {chunk_z}) not found, skipping")
                 continue
 
-            # Parse biome tints
-            biome_tints = parse_biome_tints(chunk_data)
+            # Parse heightmap and biome tints
+            parsed_data = parse_biome_tints(chunk_data)
+            if parsed_data is None:
+                print(f"  Chunk ({chunk_x}, {chunk_z}) has no data, skipping")
+                continue
 
-            # Build heightmap for this chunk
-            heights = [[0 for _ in range(32)] for _ in range(32)]
+            heights, biome_tints = parsed_data
+
+            # Get block names at each surface position
             blocks = [["Empty" for _ in range(32)] for _ in range(32)]
-
             for z in range(32):
                 for x in range(32):
-                    height, block_name, _ = find_surface_height(chunk_data, x, z)
-                    heights[z][x] = height
+                    height = heights[z][x]
+                    # Get block at this height
+                    _, block_name, _ = find_surface_height(chunk_data, x, z)
                     blocks[z][x] = block_name
 
             # Render pixels for this chunk
@@ -90,7 +95,10 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per
                             pixel_z = (sub_z + 0.5) / pixels_per_block
 
                             # Calculate shading with sub-pixel position
-                            shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+                            if enable_shading:
+                                shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+                            else:
+                                shade = 1.0
 
                             # Apply shading
                             r = int(min(255, base_r * shade))
@@ -116,13 +124,16 @@ def render_map(start_x, start_z, end_x, end_z, output_path="map.png", pixels_per
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python render_map.py <start_chunk_x> <start_chunk_z> <end_chunk_x> <end_chunk_z> [output.png] [pixels_per_block]")
+        print("Usage: python render_map.py <start_chunk_x> <start_chunk_z> <end_chunk_x> <end_chunk_z> [output.png] [pixels_per_block] [--no-shading]")
         print()
         print("Example: python render_map.py -2 -2 2 2")
         print("  Renders a 5x5 grid of chunks at 2x resolution (320x320 pixels)")
         print()
         print("Example: python render_map.py 0 0 3 3 my_map.png 2")
         print("  Renders a 4x4 grid of chunks at 2x resolution (256x256 pixels)")
+        print()
+        print("Example: python render_map.py 0 0 3 3 my_map.png 2 --no-shading")
+        print("  Renders without terrain shading (flat colors)")
         print()
         print("  pixels_per_block: 1=32px/chunk (blocky), 2=64px/chunk (smooth, default)")
         sys.exit(1)
@@ -131,7 +142,8 @@ if __name__ == "__main__":
     start_z = int(sys.argv[2])
     end_x = int(sys.argv[3])
     end_z = int(sys.argv[4])
-    output = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].isdigit() else f"map_{start_x}_{start_z}_to_{end_x}_{end_z}.png"
-    pixels_per_block = int(sys.argv[6]) if len(sys.argv) > 6 else (int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 2)
+    output = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].isdigit() and sys.argv[5] != '--no-shading' else f"map_{start_x}_{start_z}_to_{end_x}_{end_z}.png"
+    pixels_per_block = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] != '--no-shading' else (int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 2)
+    enable_shading = '--no-shading' not in sys.argv
 
-    render_map(start_x, start_z, end_x, end_z, output, pixels_per_block)
+    render_map(start_x, start_z, end_x, end_z, output, pixels_per_block, enable_shading)

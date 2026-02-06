@@ -80,8 +80,8 @@ def read_chunk_data(chunk_x, chunk_z):
 
 def parse_biome_tints(chunk_data):
     """
-    Parse biome tint colors from BlockChunk.Data
-    Returns: 32x32 array of (r, g, b) tuples
+    Parse heightmap and biome tint colors from BlockChunk.Data
+    Returns: (heightmap, tint_colors) where heightmap is 32x32 shorts and tint_colors is 32x32 RGB tuples
     """
     if 'BlockChunk' not in chunk_data['Components']:
         return None
@@ -92,13 +92,44 @@ def parse_biome_tints(chunk_data):
     # Read needsPhysics (1 byte)
     needs_physics = struct.unpack('B', reader.read(1))[0]
 
-    # Parse ShortBytePalette (heightmap) - we'll skip this
+    # Parse ShortBytePalette (heightmap) - 10-bit indices
     height_count = struct.unpack('<H', reader.read(2))[0]
-    # Skip height palette entries (2 bytes each)
-    reader.read(height_count * 2)
-    # Skip packed height data
+
+    # Read height palette (short values)
+    height_palette = []
+    for i in range(height_count):
+        height = struct.unpack('<H', reader.read(2))[0]
+        height_palette.append(height)
+
+    # Read packed height indices
     height_packed_len = struct.unpack('<I', reader.read(4))[0]
-    reader.read(height_packed_len)
+    height_packed_data = reader.read(height_packed_len)
+
+    # Unpack 10-bit indices (1024 values, 1280 bytes)
+    heightmap = [[0 for _ in range(32)] for _ in range(32)]
+    for i in range(1024):
+        # Extract 10-bit value from packed data
+        bit_offset = i * 10
+        byte_offset = bit_offset // 8
+        bit_in_byte = bit_offset % 8
+
+        # Read 2 bytes to get the 10-bit value
+        if byte_offset + 1 < len(height_packed_data):
+            byte1 = height_packed_data[byte_offset]
+            byte2 = height_packed_data[byte_offset + 1] if byte_offset + 1 < len(height_packed_data) else 0
+
+            # Extract 10 bits
+            value = ((byte1 >> bit_in_byte) | (byte2 << (8 - bit_in_byte))) & 0x3FF
+
+            # Map to x, z coordinates (Z-major: index = z * 32 + x)
+            x = i % 32
+            z = i // 32
+
+            # Look up height in palette
+            if value < len(height_palette):
+                heightmap[z][x] = height_palette[value]
+            else:
+                heightmap[z][x] = 0  # Fallback
 
     # Parse IntBytePalette (biome tints)
     tint_count = struct.unpack('<H', reader.read(2))[0]
@@ -142,7 +173,7 @@ def parse_biome_tints(chunk_data):
             else:
                 tint_colors[z][x] = (255, 255, 255)  # White fallback
 
-    return tint_colors
+    return heightmap, tint_colors
 
 
 def parse_block_section(section_data):
@@ -615,7 +646,7 @@ def calculate_shading(height, neighbors, pixel_x=0.5, pixel_z=0.5):
     return ambient + diffuse * lambert
 
 
-def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2):
+def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2, enable_shading=True):
     """
     Render a chunk to a PNG image
 
@@ -624,6 +655,7 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2):
         chunk_z: Chunk Z coordinate (world_z // 32)
         output_path: Output PNG file path
         pixels_per_block: Resolution multiplier (1=32x32, 2=64x64, etc.)
+        enable_shading: Whether to apply terrain shading (default True)
     """
     print(f"Rendering chunk ({chunk_x}, {chunk_z})...")
 
@@ -632,21 +664,23 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2):
     if chunk_data is None:
         return
 
-    # Parse biome tints
-    print("Parsing biome tints...")
-    biome_tints = parse_biome_tints(chunk_data)
-    if biome_tints is None:
-        print("Warning: No biome tint data found, using colors without tinting")
+    # Parse heightmap and biome tints
+    print("Parsing heightmap and biome tints...")
+    parsed_data = parse_biome_tints(chunk_data)
+    if parsed_data is None:
+        print("Warning: No chunk data found")
+        return
 
-    # Create 32x32 heightmap
-    print("Building heightmap...")
-    heights = [[0 for _ in range(32)] for _ in range(32)]
+    heights, biome_tints = parsed_data
+
+    # Get block names at each surface position
+    print("Reading surface blocks...")
     blocks = [["Empty" for _ in range(32)] for _ in range(32)]
-
     for z in range(32):
         for x in range(32):
-            height, block_name, _ = find_surface_height(chunk_data, x, z)
-            heights[z][x] = height
+            height = heights[z][x]
+            # Get block at this height
+            _, block_name, _ = find_surface_height(chunk_data, x, z)
             blocks[z][x] = block_name
 
     # Create image
@@ -687,7 +721,10 @@ def render_chunk(chunk_x, chunk_z, output_path="chunk.png", pixels_per_block=2):
                     pixel_z = (sub_z + 0.5) / pixels_per_block
 
                     # Calculate shading with sub-pixel position
-                    shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+                    if enable_shading:
+                        shade = calculate_shading(height, (n, s, w, e, nw, ne, sw, se), pixel_x, pixel_z)
+                    else:
+                        shade = 1.0
 
                     # Apply shading
                     r = int(min(255, base_r * shade))
